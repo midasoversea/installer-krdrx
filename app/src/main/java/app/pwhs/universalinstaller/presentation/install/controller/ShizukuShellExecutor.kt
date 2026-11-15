@@ -169,16 +169,32 @@ object ShizukuShellExecutor {
                 null,
                 null,
             ) as Process
-            val finished = process.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
-            if (!finished) {
+            // ShizukuRemoteProcess does not reliably support Process.waitFor(timeout, unit):
+            // that overload polls exitValue(), which can throw "process hasn't exited".
+            // Drain both streams concurrently to avoid filling the remote process pipe.
+            val stdoutFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                process.inputStream.bufferedReader().use { it.readText() }
+            }
+            val stderrFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                process.errorStream.bufferedReader().use { it.readText() }
+            }
+            val exitFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                process.waitFor()
+            }
+            val exitCode = try {
+                exitFuture.get(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: java.util.concurrent.TimeoutException) {
                 runCatching { process.destroyForcibly() }
+                exitFuture.cancel(true)
+                stdoutFuture.cancel(true)
+                stderrFuture.cancel(true)
                 throw RuntimeException(
                     "shizuku shell timed out after ${timeoutSeconds}s — vendor build may have a broken `$cmd` (try Force stop first, or use Clear all data)",
+                    e,
                 )
             }
-            val stdout = process.inputStream.bufferedReader().use { it.readText() }
-            val stderr = process.errorStream.bufferedReader().use { it.readText() }
-            val exitCode = process.exitValue()
+            val stdout = stdoutFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            val stderr = stderrFuture.get(5, java.util.concurrent.TimeUnit.SECONDS)
             val tokenOk = successToken == null || stdout.contains(successToken, ignoreCase = true)
             if (exitCode != 0 || !tokenOk) {
                 throw RuntimeException(
